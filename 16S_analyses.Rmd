@@ -1,0 +1,213 @@
+---
+title: "Analyses for 16S data"
+output: html_notebook
+---
+Start with a phyloseq object: combine an ASV table, a taxa file and a meta data file
+
+```{r}
+library(phyloseq)
+library(dplyr)
+library(ggplot2)
+phylo_object<-phyloseq(otu_table(otu_table,taxa_are_rows=FALSE),sample_data(meta_file),tax_table(taxa_file))
+#remove chloroplasts and unassigned classes (those are likely chimeras or errors) from data
+phylo_onject2<-subset_taxa(phylo_object, !is.na(Class)& !Class %in% c("","Chloroplast"))
+```
+
+
+Rarefy for peace of mind
+```{r}
+sample_sums(phylo_object2) #check distribution of read numbers to decide what depth to rarefy to (here 15000)
+phylo_object3<-prune_samples(sample_sums(phylo_object2)>15000,phylo_object2) #remove samples which have lower counts than chosen rarefaction depth
+set.seed(57237) #important to make rarefaction step repeatable
+phylo_rare<-rarefy_even_depth(phylo_object3,sample.size=15000)
+```
+
+Make a phylogenetic tree for rarefied set
+```{r}
+library(DECIPHER)#package needed for alignment
+tax<-tax_table(phylo_rare) #taxa table of rarefied set
+samp<-sample_data(phylo_rare) #meta data table for rarefied set
+tabred<-otu_table(phylo_rare) #rarefied ASV table
+tax_mat<-as.matrix(tax) #convert tax table obect to matrix
+spec<-row.names(tax_mat) #the row names are actually the sequences of the ASVs
+spec<-as.matrix(spec) #convert to matrix
+colnames(spec)<-c("Species")
+tax_new<-cbind(tax_mat,spec)#add sequence as species column to tax table
+tax_tab<-tax_table(tax_new)#make matrix a tax table again
+rownames(tax_tab)<-tax_tab[,7]#make the rownames the sequences again
+phylo_rare2<-phyloseq(otu_table(tabred,taxa_are_rows=FALSE),sample_data(samp),tax_table(tax_tab))
+taxa_names(phylo_rare2)<-paste0("ASV_",seq(ntaxa(phylo_rare2)))#phylo_rare2 now has shorter ASV names
+seqs<-tax_new[,7]#extract column with the sequences
+names(seqs) <- taxa_names(phylo_rare2) # This propagates the new names to the tip labels of the tree
+alignment <- AlignSeqs(DNAStringSet(seqs), anchor=NA)#this takes hours
+writeXStringSet(alignment,"~/Desktop/pslrare2_align.fasta")#export and make tree with fasttree (gtr model) or re-assigne taxonomy (remove gaps first)
+tree<-read.tree("pslrare_tree")#import tree made of alignment with FastTree
+phylo_rare2<-phyloseq(otu_table(tabred,taxa_are_rows=FALSE),sample_data(samp),tax_table(tax_tab),phy_tree(tree))#add tree to your object
+```
+
+Add a different taxonomic assignment (e.g. from fresh train)
+```{r}
+fresh<-read.table("~/Documents/lakepulse/fresh_train_assign/wd_psl4/data/otus.98.80.80.taxonomy",h=T)
+row.names(fresh)<-fresh$ASV
+fresh$ASV<-NULL
+fresh<-as.matrix(fresh)
+
+phylo_rare_fresh<-phyloseq(otu_table(tabred,taxa_are_rows=FALSE),sample_data(samp),tax_table(fresh),phy_tree(tree))#ps object with new taxonomy
+tabrednew<-otu_table(phylo_rare_fresh)#ASV table with new shorter names
+```
+
+Calculate spatial eigenvectors from distance data
+```{r}
+library(ape)
+library(vegan)
+library(adespatial)
+distance<-read.table("dist.txt",h=T,row.names=1)#import a distance table (distances between your samples)
+names(distance)<-row.names(distance)
+dista<-as.dist(distance)#make distance a true distance object
+MEMs<-dbmem(dista,store.listw=TRUE)
+test.MEM<-moran.randtest(MEMs,nrepe=999)#shows you which MEMs are significant
+spat<-scores(MEMs,choices=c(1:6))#first 6 picked based on distribution of eigenvalues (much more are significant)
+row.names(spat)<-row.names(distance)
+```
+
+Calculate Shannon diversity for for unrarefied, cleaned data
+```{r}
+alpha_div <- estimate_richness(phylo_object2, split = TRUE, measure = "Shannon")
+```
+
+Prepare the meta data
+```{r}
+meta<-read.table("meta_master.txt",h=T)
+row.names(meta)<-meta$Lake_ID
+keep<-sample_names(phylo_rare_fresh)
+meta_shorter<-meta[rownames(meta) %in% keep,]#this removes rows for samples which got excluded due to 
+full_data<-merge(spat,meta_shorter,by="row.names",all.x=FALSE)#new metadata combines old data and MEMs
+row.names(full_data)<-full_data$Row.names
+full_data$Row.names<-NULL
+full_data$shannon<-alpha_div$Shannon
+env_cur<-full_data[c(1:6,13,14,25:32,43,49)]#contains first 6 MEMs, area, depth,ions, DIC, DOC, O2 conc, TN; pick environmental variables you find of interest
+
+#PCA of env factors
+env_cur2<-na.omit(env_cur)#pca can't handle NAs, remove
+env_cur.pca<-rda(env_cur2,scale=TRUE)#scale before env. variables can be on vastly different scales
+summary(env_cur.pca)
+ev_cur<-env_cur.pca$CA$eig#look at eigenvalues
+ev_cur[ev_cur>mean(ev_cur)]#first 7 PCs explain more than mean, choose your own cut-off
+PCs<-scores(env_cur.pca,display="sites",choices=c(1:7))#extract the significant PCs
+PC_loadings<-scores(env_cur.pca, choices = 1:7, display = "species", scaling = 0)#check which environmental factors load onto them
+
+
+sem_data<-merge(PCs,full_data,by=0)
+row.names(sem_data)<-sem_data$Row.names
+sem_data$Row.names<-NULL
+sem_data$rank<-rank(sem_data$shannon)#prepare data for structural equation modelling: combine full data with first 7 PCs and ranked alpha diversity
+```
+
+Alpha diversity analysis
+Model fitting alpha diversity
+```{r}
+library(lme4)
+library(lmerTest)
+library(nlme)
+library(MuMIn)
+fit0<-gls(shannon~HumanImpact,full_data)#fit model without random effect
+summary(fit0)
+fit1<-lmer(shannon~HumanImpact+(1|Ecozone),full_data)#fit model with ecozone as random effect (random intercept)
+summary(fit1)
+fit2<-lmer(shannon~HumanImpact+(HumanImpact-1|Ecozone),full_data)#fit model with random slope instead of random intercept
+summary(fit2)
+AICc(fit0,fit1)#compare AICcs of models, chose the one that converges, fit isn't singular, and has lowerst AICc
+
+#same for land use classes
+fita0<-gls(shannon~X._agriculture+X._forestry+X._natlandscapes+X._pasture+X._urban,full_data)
+summary(fita0)
+fita1<-lmer(shannon~X._agriculture+X._forestry+X._natlandscapes+X._pasture+X._urban+(1|Ecozone),full_data)
+AICc(fita0,fita1)
+
+#Alpha diversity figure
+plot(shannon~HumanImpact,full_data,axes=FALSE,pch=8,xlab="Human Impact Index",ylab="Shannon Diversity")
+axis(1,las=1)
+axis(2,las=1)
+abline(4.46,-0.31)
+```
+
+Structural equation modelling: WRITE MODELS
+```{r}
+m1 <-"rank ~ PC1+PC2+PC3+PC4+PC5+PC6+PC7+HumanImpact
+PC1 ~ HumanImpact
+PC2 ~ HumanImpact
+PC3 ~ HumanImpact
+PC4 ~ HumanImpact
+PC5 ~ HumanImpact
+PC6 ~ HumanImpact
+PC7 ~ HumanImpact
+"
+m2 <-"rank ~  PC1+PC2+PC3+PC4+PC5+PC6+PC7+X._agriculture+X._forestry+X._natlandscapes+X._pasture+X._urban
+PC1 ~ X._agriculture+X._forestry+X._natlandscapes+X._pasture+X._urban
+PC2 ~ X._agriculture+X._forestry+X._natlandscapes+X._pasture+X._urban
+PC3 ~ X._agriculture+X._forestry+X._natlandscapes+X._pasture+X._urban
+PC4 ~ X._agriculture+X._forestry+X._natlandscapes+X._pasture+X._urban
+PC5 ~ X._agriculture+X._forestry+X._natlandscapes+X._pasture+X._urban
+PC6 ~ X._agriculture+X._forestry+X._natlandscapes+X._pasture+X._urban
+PC7 ~ X._agriculture+X._forestry+X._natlandscapes+X._pasture+X._urban
+"
+```
+
+```{r}
+library(lavaan)
+sem_m1 <- sem(m1, data=sem_data, missing="ml", fixed.x=F, std.ov=T,se = "bootstrap")
+summary(sem_m1, rsq=T, fit.measures=T, standardized=TRUE)
+#choose a model where model where overall p-value is >>0.05 (this shows that a null model without explanatory variables does not fit data better), cfi index close to 1
+```
+
+
+```{r}
+sem_m2 <- sem(m2, data=sem_data, missing="ml", fixed.x=F, std.ov=T,se = "bootstrap")
+summary(sem_m2, rsq=T, fit.measures=T, standardized=TRUE)
+```
+
+
+
+Beta-diversity
+Adonis will determine Bray-Curtis dissimilarity
+```{r}
+#Exclude lakes without PC coordinates
+include<-row.names(env_cur2)
+tabrednew_red<-tabrednew[(row.names(tabrednew) %in% include),]#choose lakes for which you have PCs
+adonis_model2 <- adonis(tabrednew_red~PC1+PC2+PC3+PC4+PC5+PC6+PC7,data=sem_data, permutations = 999)
+adonis_model2$aov.tab
+```
+
+
+dbRDA
+```{r}
+out.brayrare<-vegdist(tabrednew,"bray")#make distance table out of ASV table
+dbrda<-capscale(out.brayrare~.,data=q)#test the overall model, only proceed if significant
+step.forward<-ordiR2step(capscale(out.brayrare~1,data=q),scope=formula(dbrda),direction="forward",pstep=1000)#this will add explanatory variables until explained variation does not increase anymore
+pars<-capscale(out.brayrare~MEM4+X._natlandscapes+Lake_depth.m.+X._forestry+X._agriculture+MEM2+MEM5+MEM1+X._pasture+X._urban+Lake_area.km2.+MEM3,data=q)#this is the reduced model with all the significant variables
+anova.cca(pars,step=1000)
+vif.cca(pars)#variance inflation factors, should be <<10
+R2pars<-RsquareAdj(pars)$adj.r.squared#explained variation
+
+
+#Color sites by ecozone
+#samples
+sit.scl<-scores(pars,display="sites",scaling=1)#get positions for all samples
+sites<-data.frame(sit.scl)
+sites$sampleid<-rownames(sites)
+phylo_rare_fresh_sample<-as.matrix(sample_data(phylo_rare_fresh))
+phylo_rare_fresh_sample<-as.data.frame(phylo_rare_fresh_sample)
+sites<-sites %>% left_join(phylo_rare_fresh_sample)#join ecozone info with site scores
+arrow_scl<-scores(pars,display='bp',scaling=1)
+mul<-ordiArrowMul(arrow_scl,fill=1)
+arrow.scl.mul<-arrow_scl*mul
+arrow.df<-data.frame(arrow.scl.mul,labels=rownames(arrow.scl.mul))
+arrow_map = aes(xend = CAP1, yend = CAP2, x = 0, y = 0, shape = NULL, color = NULL, 
+    label = labels)
+label_map = aes(x = 1.2 * CAP1, y = 1.2 * CAP2, shape = NULL, color = NULL, 
+    label = labels)
+arrowhead=arrow(length=unit(0.03,"npc"))
+
+site_dbrda<-ggplot()+geom_point(data=sites,aes(x=CAP1,y=CAP2,color=ecozone))+theme_classic()+scale_color_brewer(palette='Dark2')+geom_segment(arrow_map,size=0.5,data=arrow.df,arrow=arrowhead)+geom_text(label_map,size=4,data=arrow.df)
+```
+
